@@ -1,0 +1,165 @@
+import os.path as osp
+import json
+import os
+import glob
+import cv2
+import shutil
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def convert_via_to_coco(rootdir, out_dir, out_file, categories):
+
+    if not osp.exists(out_dir): os.mkdir(out_dir)
+    
+    img_count = 0
+    obj_count = 0
+    images = []
+    annotations = []
+    for root, subdirs, files in os.walk(rootdir):
+        json_path = glob.glob(osp.join(root, "*mask*.json")) # json_path mask 0-kern, 1-breed, 2-circle, 3-mask
+        if json_path:
+            with open(json_path[0], "r") as read_file: 
+                data_infos = json.load(read_file)
+        else:
+            continue
+        
+        for v in data_infos.values():
+            if not v['regions']:
+                print('Regions is empty! File:', osp.join(root,v['filename']))
+                continue
+            filename = v['filename']
+            out_filename = str(img_count)+'_'+filename
+            img_path = osp.join(out_dir, out_filename)
+            shutil.copy2(osp.join(root, filename), img_path)
+            img = cv2.imread(img_path)
+            height, width = img.shape[:2]
+            
+            images.append(dict(
+                id=img_count,
+                file_name=out_filename,
+                height=height,
+                width=width))
+
+            for obj in v['regions']:
+                obj = obj['shape_attributes']
+                points_x = []
+                points_y = []
+                if obj['name'] == 'rect':
+                    points_x = [obj['x'], obj['x'] + obj['width'], obj['x'] + obj['width'], obj['x']]
+                    points_y = [obj['y'], obj['y'], obj['y'] + obj['height'], obj['y'] + obj['height']]
+                elif obj['name'] == 'circle':
+                    cx = obj['cx']
+                    cy = obj['cy']
+                    radius = obj['r']
+                    # Create polygon shaped based on connecting lines from/to following degress
+                    theta = np.arange(0, 2*np.pi, 0.1)
+                    x = radius*np.cos(theta)
+                    y = radius*np.sin(theta)
+                    points_x = cx + x
+                    points_y = cy + y
+                    # for xx, yy in zip(points_x, points_y):
+                    #     cv2.circle(img, (int(xx), int(yy)), 2, (0, 255, 0), -1)
+                    # plt.imshow(img)
+                    # plt.show()
+                elif obj['name'] == 'ellipse':
+                    cx = obj['cx']
+                    cy = obj['cy']
+                    radius_x = obj['rx']
+                    radius_y = obj['ry']
+                    angle = -obj['theta']
+                    # Calculate points
+                    theta = np.arange(0, 2*np.pi, 0.1)
+                    xpos = radius_x*np.cos(theta)
+                    ypos = radius_y*np.sin(theta)
+                    x = xpos*np.cos(angle)+ypos*np.sin(angle)
+                    y = -xpos*np.sin(angle)+ypos*np.cos(angle)
+                    points_x = cx + x
+                    points_y = cy + y
+                    # for xx, yy in zip(points_x, points_y):
+                    #     cv2.circle(img, (int(xx), int(yy)), 2, (0, 255, 0), -1)
+                    # cv2.ellipse(img, (cx, cy), (round(radius_x), round(radius_y)), math.degrees(obj['theta']), 0, 360, (0, 255, 0), 2)
+                    # plt.imshow(img)
+                    # plt.show()
+                elif obj['name'] == 'polygon' or obj['name'] == 'polyline':
+                    points_x = obj['all_points_x']
+                    points_y = obj['all_points_y']
+                else:
+                    continue
+
+                # Bbox                
+                x_min, y_min, x_max, y_max = (
+                    min(points_x), min(points_y), max(points_x), max(points_y))
+                # Polygon
+                poly = [(x, y) for x, y in zip(points_x, points_y)]
+                poly = [p for x in poly for p in x]
+
+                data_anno = dict(
+                    image_id=img_count,
+                    id=obj_count,
+                    category_id=0,
+                    bbox=[x_min, y_min, x_max - x_min, y_max - y_min],
+                    area=(x_max - x_min) * (y_max - y_min),
+                    segmentation=[poly],
+                    iscrowd=0)
+                annotations.append(data_anno)
+                obj_count += 1
+            img_count += 1
+
+    coco_format_json = dict(
+        images=images,
+        annotations=annotations,
+        categories=categories)
+
+    with open(osp.join(out_dir, out_file), 'w') as outfile:
+        json.dump(coco_format_json, outfile)
+
+
+def train_val_test(in_dir, ann_file, categories):
+
+    train_dir = 'train'
+    val_dir = 'val'
+    test_dir = 'test'
+    if not osp.exists(train_dir): os.mkdir(train_dir)
+    if not osp.exists(val_dir): os.mkdir(val_dir)
+    if not osp.exists(test_dir): os.mkdir(test_dir)
+
+    json_path = osp.join(in_dir, ann_file)
+    with open(json_path, "r") as read_file:
+        data_infos = json.load(read_file)
+
+    images = data_infos['images']
+    annotations = data_infos['annotations']
+
+    # Shuffle and divide to train, val and test
+    random.shuffle(images)
+    train_images = images[:int(0.7*len(images))]
+    val_images = images[int(0.7*len(images)): int(0.85*len(images))]
+    test_images = images[int(0.85*len(images)):]
+    
+    dirs = {train_dir: train_images,
+            val_dir: val_images,
+            test_dir: test_images}
+
+    # Collect train, val, test data
+    for dir, dir_images in dirs.items():
+        imgs = [] 
+        ids = []
+        for v in dir_images:
+            filename = v['file_name']
+            shutil.copy2(osp.join(in_dir, filename), osp.join(dir, filename))
+            imgs.append(v)
+            ids.append(v['id'])
+        anns = [ann for ann in annotations if ann['image_id'] in ids]
+        coco_format_json = dict(
+            images=imgs,
+            annotations=anns,
+            categories=categories)
+        with open(osp.join(dir, dir+'_'+ann_file), 'w') as outfile:
+            json.dump(coco_format_json, outfile)
+            
+
+
+convert_via_to_coco('../KERN_DATASET', './all', 'annotation_coco.json', categories=[{'id': 0, 'name': 'mask'}])
+train_val_test('./all', 'annotation_coco.json', categories=[{'id': 0, 'name': 'mask'}])
